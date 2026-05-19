@@ -226,6 +226,7 @@ def _generate_aviary_xml(
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
     <rgba haze="0.15 0.25 0.35 1"/>
     <global azimuth="-20" elevation="-20"/>
+    <quality shadowsize="2048"/>
   </visual>
 
   <asset>
@@ -244,7 +245,7 @@ def _generate_aviary_xml(
   </asset>
 
   <worldbody>
-    <light pos="0 0 3" dir="0 0 -1" directional="true"/>
+    <light pos="0 0 3" dir="0 0 -1" directional="true" castshadow="false"/>
     <geom name="floor" size="10 10 0.05" type="plane" material="groundplane" contype="1" conaffinity="1"/>
 {drone_bodies}{obstacle_bodies}
   </worldbody>
@@ -1010,8 +1011,22 @@ class BaseAviary(gym.Env):
     # RENDERING
     ############################################################################
 
-    def render(self):
-        """Render the environment."""
+    # Camera mode constants
+    CAMERA_TRACK = "track"       # Follows drone from fixed distance
+    CAMERA_FPV = "fpv"           # First-person (egocentric) from drone
+    CAMERA_FIXED = "fixed"       # Fixed third-person view
+
+    def render(self, camera_mode=None, track_drone_id=0):
+        """Render the environment.
+
+        Parameters
+        ----------
+        camera_mode : str, optional
+            One of "track" (follows drone), "fpv" (first-person), "fixed" (static).
+            Defaults to "track".
+        track_drone_id : int
+            Which drone to track/follow for "track" and "fpv" modes.
+        """
         if self.render_mode == "human":
             if self._viewer is None:
                 self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
@@ -1019,7 +1034,50 @@ class BaseAviary(gym.Env):
         elif self.render_mode == "rgb_array":
             if self._renderer is None:
                 self._renderer = mujoco.Renderer(self.model, height=480, width=640)
-            self._renderer.update_scene(self.data)
+
+            if camera_mode is None:
+                camera_mode = self.CAMERA_TRACK
+
+            camera = mujoco.MjvCamera()
+
+            if camera_mode == self.CAMERA_FPV:
+                # First-person: use drone's onboard camera if available
+                cam_name = f"drone{track_drone_id}_cam"
+                cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, cam_name)
+                if cam_id >= 0:
+                    self._renderer.update_scene(self.data, camera=cam_name)
+                    return self._renderer.render()
+                else:
+                    # Fallback: place virtual FPV camera at drone position looking forward
+                    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+                    pos = self.pos[track_drone_id]
+                    # Look ahead in x direction from drone's POV
+                    camera.lookat[:] = pos + np.array([2.0, 0.0, -0.3])
+                    camera.distance = 0.01
+                    camera.azimuth = 90
+                    camera.elevation = -10
+
+            elif camera_mode == self.CAMERA_FIXED:
+                # Fixed third-person: static camera looking at scene center
+                camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+                # Look at average drone height
+                avg_z = self.pos[:, 2].mean()
+                camera.lookat[:] = [0, 0, avg_z]
+                camera.distance = 1.2
+                camera.azimuth = -60
+                camera.elevation = -25
+
+            else:  # CAMERA_TRACK (default)
+                # Tracks the drone(s) from a fixed relative distance
+                camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+                centroid = self.pos.mean(axis=0)
+                camera.lookat[:] = centroid
+                spread = np.linalg.norm(self.pos.max(0) - self.pos.min(0))
+                camera.distance = max(0.5, spread * 1.2 + 0.3)
+                camera.azimuth = -45
+                camera.elevation = -15
+
+            self._renderer.update_scene(self.data, camera)
             return self._renderer.render()
         return None
 

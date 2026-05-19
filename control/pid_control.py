@@ -120,6 +120,10 @@ class PIDControl:
         # Desired thrust
         target_acc[2] += self.GRAVITY  # Compensate gravity
         thrust = self.MASS * np.linalg.norm(target_acc)
+        # Prevent thrust direction from flipping (drone can't thrust downward)
+        if target_acc[2] < 0:
+            target_acc[2] = 0.0
+            thrust = self.MASS * np.linalg.norm(target_acc)
 
         # Desired attitude from desired acceleration
         # (simplified: assumes small angles)
