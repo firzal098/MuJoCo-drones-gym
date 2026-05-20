@@ -291,7 +291,8 @@ def demo_vertical_circle():
     start_target = center + np.array([0.0, radius, 0.0])
     stabilize(env, ctrl, start_target, steps=600)
 
-    frames = []
+    frames_track = []
+    frames_front = []
     total_steps = 600  # ~2 full loops
     for i in range(total_steps):
         theta = 2 * np.pi * (i / 300)  # one loop per 300 steps
@@ -301,9 +302,11 @@ def demo_vertical_circle():
             env.CTRL_TIMESTEP, env.pos[0], env.quat[0], env.vel[0], env.ang_v[0], target)
         env.step(rpm.flatten())
         if i % 3 == 0:
-            frames.append(env.render(camera_mode="track"))
+            frames_track.append(env.render(camera_mode="track"))
+            frames_front.append(env.render(camera_mode="front"))
     env.close()
-    save_gif(frames, "/root/multi_drone_mujoco/demo_gifs/vertical_circle.gif")
+    save_gif(frames_track, "/root/multi_drone_mujoco/demo_gifs/vertical_circle.gif")
+    save_gif(frames_front, "/root/multi_drone_mujoco/demo_gifs/vertical_circle_front.gif")
 
 
 if __name__ == "__main__":

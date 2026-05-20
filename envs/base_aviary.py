@@ -1015,6 +1015,7 @@ class BaseAviary(gym.Env):
     CAMERA_TRACK = "track"       # Follows drone from fixed distance
     CAMERA_FPV = "fpv"           # First-person (egocentric) from drone
     CAMERA_FIXED = "fixed"       # Fixed third-person view
+    CAMERA_FRONT = "front"       # Front view looking along X-axis
 
     def render(self, camera_mode=None, track_drone_id=0):
         """Render the environment.
@@ -1056,6 +1057,15 @@ class BaseAviary(gym.Env):
                     camera.distance = 0.01
                     camera.azimuth = 90
                     camera.elevation = -10
+
+            elif camera_mode == self.CAMERA_FRONT:
+                # Front view: camera looks along X-axis at the Y-Z plane
+                camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+                centroid = self.pos.mean(axis=0)
+                camera.lookat[:] = centroid
+                camera.distance = 2.0
+                camera.azimuth = 90
+                camera.elevation = 0
 
             elif camera_mode == self.CAMERA_FIXED:
                 # Fixed third-person: static camera looking at scene center
