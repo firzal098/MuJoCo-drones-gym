@@ -18,8 +18,13 @@ from gymnasium import spaces
 from multi_drone_mujoco.utils.enums import DroneModel, Physics, ActionType, ObservationType, ImageType
 
 # Paths
-MENAGERIE_PATH = Path(__file__).resolve().parent.parent.parent / "mujoco_menagerie"
+# CF2 mesh files (.obj) are vendored under multi_drone_mujoco/assets/cf2.
+# They were copied from google-deepmind/mujoco_menagerie (bitcraze_crazyflie_2)
+# so users no longer need to clone the whole menagerie repo. To use a different
+# checkout, set the MJ_DRONES_CF2_ASSETS env var to its assets dir.
 ASSETS_PATH = Path(__file__).resolve().parent.parent / "assets"
+CF2_MESH_DIR = Path(os.environ.get("MJ_DRONES_CF2_ASSETS",
+                                   str(ASSETS_PATH / "cf2")))
 
 ################################################################################
 # Crazyflie 2.x physical parameters (from Forster 2015 system identification)
@@ -102,7 +107,7 @@ def _generate_aviary_xml(
     timestep: float = 1 / 240,
 ) -> str:
     """Generate MuJoCo XML for the aviary with N drones."""
-    meshdir = str(MENAGERIE_PATH / "bitcraze_crazyflie_2" / "assets")
+    meshdir = str(CF2_MESH_DIR)
     params = DRONE_PARAMS[drone_model]
 
     # Visual and collision meshes
