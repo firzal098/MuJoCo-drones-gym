@@ -166,9 +166,14 @@ multi_drone_mujoco/
 If you use this work, please cite:
 
 ```bibtex
-@software{mj_drones_gym,
-  title={MJ-drones-gym: MuJoCo Multi-Drone Environments for RL},
-  year={2026},
+@misc{tayal2026mujocodronesgym,
+  title={MuJoCo-Drones-Gym: A GPU-Accelerated Multi-Drone Simulator for Control and Reinforcement Learning}, 
+      author={Manan Tayal},
+      year={2026},
+      eprint={2606.08039},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2606.08039}, 
 }
 ```
 
