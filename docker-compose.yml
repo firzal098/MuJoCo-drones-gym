@@ -1,0 +1,37 @@
+# GPU stack (JAX/MJX + Brax training).
+#
+# Usage:
+#   docker compose build
+#   docker compose run --rm mujoco-drones-gym python train_single_rl_jax.py
+#   docker compose run --rm mujoco-drones-gym python verify_env_jax.py
+#   docker compose run --rm mujoco-drones-gym bash
+
+services:
+  mujoco-drones-gym:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mujoco-drones-gym:latest
+    working_dir: /app
+    volumes:
+      - .:/app
+      - jax-cache:/app/.jax_cache
+    environment:
+      MUJOCO_GL: egl
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      XLA_PYTHON_CLIENT_ALLOCATOR: platform
+      XLA_FLAGS: "--xla_gpu_force_compilation_parallelism=1"
+      JAX_COMPILATION_CACHE_DIR: /app/.jax_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+
+volumes:
+  jax-cache:

@@ -1,0 +1,37 @@
+# CPU-only image (SB3 training, env verification, ONNX export).
+# Lighter than the GPU image; no CUDA/JAX GPU stack.
+#
+# Build:  docker build -f Dockerfile.cpu -t mujoco-drones-gym:cpu .
+# Run:    docker compose -f docker-compose.cpu.yml run --rm mujoco-drones-cpu python verify_env.py
+
+FROM python:3.10-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    MUJOCO_GL=egl
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libgl1-mesa-glx \
+    libglew2.2 \
+    libosmesa6 \
+    libegl1 \
+    libglfw3 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml setup.py README.md ./
+COPY multi_drone_mujoco/ multi_drone_mujoco/
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install -e ".[rl,marl,viz,fork]" \
+    && pip install "jax[cpu]" "mujoco-mjx>=3.0.0"
+
+COPY *.py ./
+COPY docker/ docker/
+
+RUN mkdir -p /app/results
+
+CMD ["bash"]

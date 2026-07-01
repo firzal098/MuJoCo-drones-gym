@@ -32,6 +32,8 @@ def downwash_demo():
         ctrl_freq=48,
         act_type=ActionType.RPM,
         initial_xyzs=initial_xyzs,
+        gui=True,              # <--- ADD THIS
+        render_mode="human"    # <--- ADD THIS
     )
 
     controllers = [PIDControl(env) for _ in range(2)]

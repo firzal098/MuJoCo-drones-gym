@@ -12,7 +12,7 @@ from multi_drone_mujoco.control.dsl_pid_control import DSLPIDControl
 from multi_drone_mujoco.utils.enums import DroneModel, Physics, ActionType, ObservationType
 from multi_drone_mujoco.utils.logger import Logger
 
-
+import time
 def pid_hover():
     """Hover a single drone at z=1.0 using PID control."""
     print("=" * 60)
@@ -78,6 +78,8 @@ def pid_velocity():
         ctrl_freq=48,
         act_type=ActionType.RPM,
         initial_xyzs=np.array([[0, 0, 0.5]]),
+        gui=True,              # <--- ADD THIS
+        render_mode="human"    # <--- ADD THIS
     )
 
     ctrl = DSLPIDControl(env)

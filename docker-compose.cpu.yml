@@ -1,0 +1,20 @@
+# CPU stack (SB3, env checks, ONNX export).
+#
+# Usage:
+#   docker compose -f docker-compose.cpu.yml build
+#   docker compose -f docker-compose.cpu.yml run --rm mujoco-drones-cpu python train_single_rl.py
+#   docker compose -f docker-compose.cpu.yml run --rm mujoco-drones-cpu python verify_env.py
+
+services:
+  mujoco-drones-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: mujoco-drones-gym:cpu
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      MUJOCO_GL: egl
+    stdin_open: true
+    tty: true

@@ -176,7 +176,7 @@ def _generate_aviary_xml(
     <body name="{prefix}" pos="{x} {y} {z}" quat="{qw} {qx} {qy} {qz}">
       <freejoint name="{prefix}_joint"/>
       <inertial pos="0 0 0" mass="{mass}" diaginertia="{ixx} {iyy} {izz}"/>
-      <geom name="{prefix}_collision" type="cylinder" size="{params['collision_r']} {params['collision_h'] / 2}" rgba="0 0 0 0" contype="1" conaffinity="1"/>
+      <geom name="{prefix}_collision" type="sphere" size="{params['collision_r']}" rgba="0 0 0 0" contype="1" conaffinity="1"/>
       <geom mesh="cf2_vis_0" material="propeller_plastic" class="visual"/>
       <geom mesh="cf2_vis_1" material="medium_gloss_plastic" class="visual"/>
       <geom mesh="cf2_vis_2" material="polished_gold" class="visual"/>
@@ -1037,6 +1037,16 @@ class BaseAviary(gym.Env):
         if self.render_mode == "human":
             if self._viewer is None:
                 self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+                self._viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                self._viewer.cam.trackbodyid = mujoco.mj_name2id(
+                    self.model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    "drone0"
+                )
+                self._viewer.cam.distance = 3.0
+                self._viewer.cam.elevation = -20
+                self._viewer.cam.azimuth = -90
+                
             self._viewer.sync()
         elif self.render_mode == "rgb_array":
             if self._renderer is None:

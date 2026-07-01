@@ -28,6 +28,14 @@ all = [
     "jax[cuda12]",
     "mujoco-mjx>=3.0.0",
 ]
+fork = [
+    "brax>=0.14.0",
+    "tensorboard>=2.15.0",
+    "torch>=2.0.0",
+    "mediapy>=1.2.0",
+    "opencv-python-headless>=4.8.0",
+    "onnxruntime>=1.16.0",
+]
 dev = [
     "pytest>=7.0",
 ]
