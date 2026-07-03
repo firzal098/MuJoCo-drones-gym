@@ -2,5 +2,5 @@ gemm {
   algorithm: -1
 }
 run_time {
-  nanos: 31744
+  nanos: 11264
 }

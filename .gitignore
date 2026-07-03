@@ -10,3 +10,5 @@ mujoco_menagerie/
 render_demos.py
 render_demos2.py
 *.mp4
+results/
+.jax_cache/

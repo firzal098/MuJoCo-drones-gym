@@ -1,5 +1,5 @@
 run_time {
-  nanos: 15360
+  nanos: 12288
 }
 triton {
   block_m: 16
