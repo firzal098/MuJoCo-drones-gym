@@ -44,6 +44,23 @@ def parse_args():
         default=600,
         help="Maximum evaluation steps per episode (default: 600)",
     )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Run headless batch evaluation (vmap+lax.scan, no rendering, no menu).",
+    )
+    parser.add_argument(
+        "--eval-envs",
+        type=int,
+        default=64,
+        help="Number of parallel environments for --evaluate mode (default: 64)",
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=10,
+        help="Number of evaluation episodes per parallel env for --evaluate mode (default: 10)",
+    )
     return parser.parse_args()
 
 
@@ -52,11 +69,11 @@ def default_model_path(level: int) -> str:
     return os.path.join(BASE_MODEL_DIR, f"stage_{level}_final")
 
 
-def load_predict_fn(env, model_path: str):
-    """Load params and build a JIT-compiled inference function for the given env."""
+def load_params_and_network(env, model_path: str):
+    """Load checkpoint params and build a PPO network. Returns (params, ppo_network) or (None, None)."""
     if not os.path.exists(model_path):
         print(f"[ERROR] Policy file not found at: {model_path}")
-        return None
+        return None, None
 
     print(f"Loading JAX policy from: {model_path}")
     params = model.load_params(model_path)
@@ -77,8 +94,100 @@ def load_predict_fn(env, model_path: str):
         observation_size=checkpoint_obs_size,
         action_size=env.action_size,
     )
+    return params, ppo_network
+
+
+def load_predict_fn(env, model_path: str):
+    """Load params and build a JIT-compiled inference function for the given env."""
+    params, ppo_network = load_params_and_network(env, model_path)
+    if params is None:
+        return None
     inference_fn = ppo_networks.make_inference_fn(ppo_network)
     return jax.jit(inference_fn(params, deterministic=True))
+
+
+def run_batch_evaluate(env, model_path: str, num_envs: int, num_episodes: int, episode_length: int):
+    """
+    Headless, noise-free, GPU-parallelised evaluation.
+
+    Uses:
+      - deterministic=True inference (no action noise)
+      - jax.vmap  over num_envs parallel environments
+      - jax.lax.scan over episode_length timesteps  (single fused GPU kernel)
+
+    Reports mean/std/min/max reward across num_envs * num_episodes roll-outs.
+    """
+    params, ppo_network = load_params_and_network(env, model_path)
+    if params is None:
+        return
+
+    # Deterministic inference — strips Gaussian variance, uses dist.mode() internally
+    inference_fn = ppo_networks.make_inference_fn(ppo_network)
+    raw_predict = inference_fn(params, deterministic=True)
+
+    # Normalisation state lives in params[0]; vmap it across the obs batch
+    def batched_predict(obs_batch, rng_batch):
+        """Apply policy to [N, obs_dim] observations. rng_batch unused (deterministic)."""
+        return jax.vmap(lambda o, r: raw_predict(o, r))(obs_batch, rng_batch)
+
+    # Vectorised env primitives
+    vmapped_reset = jax.vmap(env.reset)
+    vmapped_step  = jax.vmap(env.step)
+
+    @jax.jit
+    def eval_step(carry, _):
+        state, rewards, active_mask, rng = carry
+        rng, step_rng = jax.random.split(rng)
+        rngs = jax.random.split(step_rng, num_envs)
+        actions, _ = batched_predict(state.obs, rngs)
+        next_state = vmapped_step(state, actions)
+        new_rewards = rewards + next_state.reward * active_mask
+        new_mask    = active_mask * (1.0 - next_state.done)
+        return (next_state, new_rewards, new_mask, rng), None
+
+    @jax.jit
+    def run_episode_batch(rng):
+        reset_keys  = jax.random.split(rng, num_envs)
+        state       = vmapped_reset(reset_keys)
+        rewards     = jnp.zeros(num_envs)
+        active_mask = jnp.ones(num_envs)
+        (_, final_rewards, _, rng_out), _ = jax.lax.scan(
+            eval_step, (state, rewards, active_mask, rng), None, length=episode_length
+        )
+        return final_rewards, rng_out
+
+    print(f"\n{'='*55}")
+    print(f"  BATCH EVALUATION  —  Stage {env.curriculum_level}")
+    print(f"  Parallel envs  : {num_envs}")
+    print(f"  Episodes/env   : {num_episodes}")
+    print(f"  Episode length : {episode_length} steps")
+    print(f"  Total roll-outs: {num_envs * num_episodes}")
+    print(f"  Mode           : deterministic (no action noise)")
+    print(f"{'='*55}")
+    print("Compiling eval kernel (first episode)...")
+
+    rng = jax.random.PRNGKey(0)
+    all_rewards = []
+
+    for ep in range(num_episodes):
+        rng, ep_rng = jax.random.split(rng)
+        ep_rewards, rng = run_episode_batch(ep_rng)
+        ep_rewards_np = np.array(ep_rewards)
+        all_rewards.append(ep_rewards_np)
+        ep_mean = ep_rewards_np.mean()
+        ep_std  = ep_rewards_np.std()
+        print(f"  Episode {ep+1:>3}/{num_episodes}  |  mean={ep_mean:8.2f}  std={ep_std:7.2f}  "
+              f"min={ep_rewards_np.min():8.2f}  max={ep_rewards_np.max():8.2f}")
+
+    all_rewards_np = np.concatenate(all_rewards)   # shape: [num_envs * num_episodes]
+    print(f"\n{'─'*55}")
+    print(f"  SUMMARY  ({len(all_rewards_np)} total roll-outs)")
+    print(f"  Mean   : {all_rewards_np.mean():.2f}")
+    print(f"  Std    : {all_rewards_np.std():.2f}")
+    print(f"  Median : {np.median(all_rewards_np):.2f}")
+    print(f"  Min    : {all_rewards_np.min():.2f}")
+    print(f"  Max    : {all_rewards_np.max():.2f}")
+    print(f"{'='*55}\n")
 
 
 def build_gate_projector(env, cam_id, fovy):
@@ -300,6 +409,18 @@ def main():
     # ── Initial setup ─────────────────────────────────────────────────────────
     current_level = args.curriculum_level
     model_path = args.model_path or default_model_path(current_level)
+
+    # ── Batch evaluation mode (headless, no rendering, no menu) ───────────────
+    if args.evaluate:
+        env = KRTIAviaryJax(curriculum_level=current_level)
+        run_batch_evaluate(
+            env,
+            model_path=model_path,
+            num_envs=args.eval_envs,
+            num_episodes=args.eval_episodes,
+            episode_length=max_steps,
+        )
+        return
 
     # Build env + renderer once for the initial stage
     env = KRTIAviaryJax(curriculum_level=current_level)
