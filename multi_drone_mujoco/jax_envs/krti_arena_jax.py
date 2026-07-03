@@ -177,7 +177,7 @@ class KRTIAviaryJax(BaseAviaryJax):
 
     @property
     def observation_size(self):
-        return 20
+        return 21
 
     @property
     def action_size(self):
@@ -219,10 +219,11 @@ class KRTIAviaryJax(BaseAviaryJax):
             last_yolo_mem
         )
         
-        u_c_obs = jnp.where(yolo_visible, curr_u_c, new_last_yolo[0])
-        v_c_obs = jnp.where(yolo_visible, curr_v_c, new_last_yolo[1])
-        w_b_obs = jnp.where(yolo_visible, curr_w_b, new_last_yolo[2])
-        h_b_obs = jnp.where(yolo_visible, curr_h_b, new_last_yolo[3])
+        # Zero out bbox when gate is not visible — cleaner Markov signal; dir_gate_body serves as fallback
+        u_c_obs = jnp.where(yolo_visible, curr_u_c, 0.0)
+        v_c_obs = jnp.where(yolo_visible, curr_v_c, 0.0)
+        w_b_obs = jnp.where(yolo_visible, curr_w_b, 0.0)
+        h_b_obs = jnp.where(yolo_visible, curr_h_b, 0.0)
         f_vis = jnp.where(yolo_visible, 1.0, 0.0)
         
         yolo_obs = jnp.array([u_c_obs, v_c_obs, w_b_obs, h_b_obs, f_vis])
@@ -409,13 +410,16 @@ class KRTIAviaryJax(BaseAviaryJax):
         roll_scaled = jnp.clip(roll / (jnp.pi / 2.5), -1.0, 1.0)
         pitch_scaled = jnp.clip(pitch / (jnp.pi / 2.5), -1.0, 1.0)
 
+        dist_obs = jnp.clip(jnp.linalg.norm(gate_pos - d.qpos[0:3]) / 10.0, 0.0, 1.0)
+
         obs = jnp.concatenate([
-            yolo_obs,          # 5
-            vel_body_scaled,   # 3
-            omega_body_scaled, # 3
+            yolo_obs,                               # 5
+            vel_body_scaled,                        # 3
+            omega_body_scaled,                      # 3
             jnp.array([roll_scaled, pitch_scaled]), # 2
-            dir_gate_body,      # 3
-            info["prev_action"]      # 4
+            dir_gate_body,                          # 3
+            info["prev_action"],                    # 4
+            jnp.array([dist_obs]),                  # 1
         ])
 
         metrics = {
@@ -429,6 +433,7 @@ class KRTIAviaryJax(BaseAviaryJax):
             "reward_attitude": jnp.zeros(()),
             "reward_smooth": jnp.zeros(()),
             "reward_terminal": jnp.zeros(()),
+            "reward_out_of_range": jnp.zeros(()),
         }
 
         return State(
@@ -467,13 +472,17 @@ class KRTIAviaryJax(BaseAviaryJax):
         roll_scaled = jnp.clip(roll / (jnp.pi / 2.5), -1.0, 1.0)
         pitch_scaled = jnp.clip(pitch / (jnp.pi / 2.5), -1.0, 1.0)
 
+        dist_raw = jnp.linalg.norm(info["gate_pos"] - d.qpos[0:3])
+        dist_obs = jnp.clip(dist_raw / 10.0, 0.0, 1.0)
+
         return jnp.concatenate([
-            yolo_obs,          # 5
-            vel_body_scaled,   # 3
-            omega_body_scaled, # 3
+            yolo_obs,                               # 5
+            vel_body_scaled,                        # 3
+            omega_body_scaled,                      # 3
             jnp.array([roll_scaled, pitch_scaled]), # 2
-            dir_gate_body,      # 3
-            info["prev_action"]      # 4
+            dir_gate_body,                          # 3
+            info["prev_action"],                    # 4
+            jnp.array([dist_obs]),                  # 1
         ])
 
 
@@ -583,7 +592,14 @@ class KRTIAviaryJax(BaseAviaryJax):
         # Static survival credit to avoid suicide loops
         survival_reward = 0.10
 
-        step_reward = progression_reward + r_perception + reward_speed + reward_attitude + reward_smooth + survival_reward
+        # 6. Out-of-range soft penalty (discourages wandering far from gate)
+        out_of_range_penalty = jnp.where(dist_after > 8.0, -0.5, 0.0)
+
+        # Clip dense reward to prevent crash terminal event from destabilizing the critic
+        step_reward = jnp.clip(
+            progression_reward + r_perception + reward_speed + reward_attitude + reward_smooth + survival_reward + out_of_range_penalty,
+            -10.0, 10.0
+        )
 
 
         crossed_plane = (state.pipeline_state.qpos[1] > state.info["gate_pos"][1]) & (
@@ -633,8 +649,8 @@ class KRTIAviaryJax(BaseAviaryJax):
         cleared_gate = crossed_plane & within_gate_frame & velocity_forward & (~is_gate_crash) & (~is_generic_crash)
 
         # Milestone definitions
-        terminal_reward = jnp.where(cleared_gate, 100.0, 0.0)
-        terminal_reward += jnp.where(is_gate_crash | is_generic_crash, -100.0, 0.0)
+        terminal_reward = jnp.where(cleared_gate, 50.0, 0.0)
+        terminal_reward += jnp.where(is_gate_crash | is_generic_crash, -30.0, 0.0)
 
         reward = step_reward + terminal_reward
 
@@ -655,6 +671,7 @@ class KRTIAviaryJax(BaseAviaryJax):
                 "reward_attitude": reward_attitude,
                 "reward_smooth": reward_smooth,
                 "reward_terminal": terminal_reward,
+                "reward_out_of_range": out_of_range_penalty,
             }
         )
 

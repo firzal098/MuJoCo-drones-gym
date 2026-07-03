@@ -19,7 +19,7 @@ dependencies = [
 rl = ["stable-baselines3>=2.0.0"]
 marl = ["pettingzoo>=1.24.0"]
 viz = ["matplotlib>=3.5.0"]
-gpu = ["jax[cuda12]", "mujoco-mjx>=3.0.0"]
+gpu = ["jax[cuda12]", "mujoco-mjx>=3.0.0", "warp-lang", "mujoco-warp"]
 sbx = ["sbx-rl>=0.20.0"]
 all = [
     "stable-baselines3>=2.0.0",
@@ -28,6 +28,8 @@ all = [
     "Pillow>=9.0.0",
     "jax[cuda12]",
     "mujoco-mjx>=3.0.0",
+    "warp-lang",
+    "mujoco-warp",
     "sbx-rl>=0.20.0",
 ]
 fork = [

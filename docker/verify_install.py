@@ -21,6 +21,7 @@ MODULES = [
     "mediapy",
     "cv2",
     "onnxruntime",
+    "mujoco_warp",
     "multi_drone_mujoco",
 ]
 

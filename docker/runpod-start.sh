@@ -1,36 +1,52 @@
 #!/usr/bin/env bash
-# RunPod Pod start script for JAX training.
+# ============================================================
+# RunPod auto-start script for MuJoCo-drones-gym
+# ============================================================
+# Runs automatically on container start (set as CMD in Dockerfile).
+# Clones the repo then idles — run training scripts manually via SSH.
 #
-# Set in RunPod template "Container Start Command":
-#   bash /app/docker/runpod-start.sh
+# PYTHONPATH=/workspace/MuJoCo-drones-gym is set in the image,
+# so `import multi_drone_mujoco` always uses the live cloned source.
 #
-# Optional env vars:
-#   TRAIN_SCRIPT   default: train_single_rl_jax.py
-#   RUNPOD_GIT_REPO  if set, clone/pull repo into /app before training
+# Optional env var override:
+#   RUNPOD_GIT_REPO — override the repo URL
+# ============================================================
 
 set -euo pipefail
 
-cd /app
+DEFAULT_GIT_REPO="https://github.com/firzal098/MuJoCo-drones-gym.git"
+REPO_DIR="/workspace/MuJoCo-drones-gym"
+GIT_REPO="${RUNPOD_GIT_REPO:-${DEFAULT_GIT_REPO}}"
 
-if [[ -n "${RUNPOD_GIT_REPO:-}" ]]; then
-  if [[ -d /app/.git ]]; then
-    git pull
-  else
-    git clone "${RUNPOD_GIT_REPO}" /tmp/repo
-    cp -a /tmp/repo/. /app/
-  fi
-  pip install -e ".[all,fork]"
+# ── 1. Clone or pull project source ──────────────────────────
+if [[ -d "${REPO_DIR}/.git" ]]; then
+    echo "=== Pulling latest source ==="
+    git -C "${REPO_DIR}" pull
+else
+    echo "=== Cloning ${GIT_REPO} ==="
+    git clone "${GIT_REPO}" "${REPO_DIR}"
 fi
 
-mkdir -p "${JAX_COMPILATION_CACHE_DIR:-/app/.jax_cache}" /app/results
+# ── 2. Ensure runtime directories exist ──────────────────────
+mkdir -p /workspace/results /workspace/.jax_cache
 
+# ── 3. Quick sanity check ────────────────────────────────────
+echo ""
 echo "=== GPU ==="
-nvidia-smi || true
-echo "=== JAX devices ==="
-python -c "import jax; print(jax.devices())"
+nvidia-smi || echo "(nvidia-smi not available)"
+echo ""
+echo "=== Python & JAX ==="
+python --version
+python -c "import jax; print('JAX devices:', jax.devices())"
+echo ""
+echo "=== multi_drone_mujoco source ==="
+python -c "import multi_drone_mujoco; print(multi_drone_mujoco.__file__)"
 
-python docker/verify_install.py
-
-TRAIN_SCRIPT="${TRAIN_SCRIPT:-train_single_rl_jax.py}"
-echo "=== Starting ${TRAIN_SCRIPT} ==="
-exec python "${TRAIN_SCRIPT}" "$@"
+# ── 4. Idle — run training manually via SSH ───────────────────
+echo ""
+echo "=========================================================="
+echo "  Container ready. SSH in and run your training script:"
+echo "    cd /workspace/MuJoCo-drones-gym"
+echo "    python train_single_rl_sbx_mjx.py"
+echo "=========================================================="
+sleep infinity

@@ -22,10 +22,12 @@ Install / verify GPU before running:
 # ── JAX / XLA env vars — must be set BEFORE importing jax ────────────────────
 import os
 
-os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_force_compilation_parallelism=1")
-# Higher fraction than train_single_rl_sbx.py: MJX physics also lives on GPU.
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.85")
+# Preallocate a fixed pool — eliminates per-step malloc overhead.
+# 0.30 = ~6 GiB on a 20 GiB card; covers 1024 MJX envs with room to grow.
+# If you see OOM, lower this. If VRAM is mostly idle, raise it slightly.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.30")
 os.environ.setdefault("JAX_PLATFORM_NAME", "gpu")
 
 import sys

@@ -1,4 +1,7 @@
 import os
+import sys
+import argparse
+import subprocess
 # Force JAX to allocate memory dynamically as needed instead of pre-claiming 75%
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 # Limit compiler parallel threads to reduce peak host-RAM spikes during optimization
@@ -20,10 +23,38 @@ from brax.io import model
 from multi_drone_mujoco.jax_envs.krti_arena_jax import KRTIAviaryJax
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="JAX-native curriculum training for KRTI gate navigation."
+    )
+    parser.add_argument(
+        "--start-stage",
+        type=int,
+        default=1,
+        choices=[1, 2, 3, 4, 5],
+        help="Which curriculum stage to start from (default: 1). "
+             "Stages before this are skipped.",
+    )
+    parser.add_argument(
+        "--restore-checkpoint",
+        type=str,
+        default=None,
+        help="Path to a saved Brax checkpoint to restore params from before "
+             "starting --start-stage. If omitted, training starts from scratch.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     print("=" * 60)
     print("Launching Overhauled JAX-Native Curriculum Gate Navigation")
     print("=" * 60)
+    if args.start_stage > 1:
+        print(f"[RESUME] Starting from curriculum stage {args.start_stage}")
+    if args.restore_checkpoint:
+        print(f"[RESUME] Restoring params from: {args.restore_checkpoint}")
 
     # Register the environment with Brax
     envs.register_environment('krti_gate_jax', KRTIAviaryJax)
@@ -47,15 +78,19 @@ def main():
 
 
     curriculum_stages = [
-        {"level": 1, "steps": 3_000_000, "lr": 3.0e-4}, # Fixed configuration, low speed
-        {"level": 2, "steps": 3_000_000, "lr": 2.5e-4}, # Minor variations
-        {"level": 3, "steps": 4_000_000, "lr": 2.0e-4}, # Moderate variations, speed scaling
-        {"level": 4, "steps": 4_000_000, "lr": 1.5e-4}, # Camera noise, aggressive offset
-        {"level": 5, "steps": 6_000_000, "lr": 1.0e-4}, # Full domain randomization
+        {"level": 1, "steps": 12_000_000, "lr": 3.0e-4, "entropy": 2.0e-2},  # Fixed config, high exploration
+        {"level": 2, "steps": 12_000_000, "lr": 2.5e-4, "entropy": 1.5e-2},  # Minor variations
+        {"level": 3, "steps": 12_000_000, "lr": 2.0e-4, "entropy": 1.0e-2},  # Moderate variations, speed scaling
+        {"level": 4, "steps": 12_000_000, "lr": 1.5e-4, "entropy": 7.5e-3},  # Camera noise, aggressive offset
+        {"level": 5, "steps": 12_000_000, "lr": 1.0e-4, "entropy": 5.0e-3},  # Full domain randomization
     ]
 
     global_step_counter = 0
+    # Restore from a checkpoint if one was provided (e.g. when restarting a stage)
     restore_params = None
+    if args.restore_checkpoint:
+        print(f"Loading restore checkpoint: {args.restore_checkpoint}")
+        restore_params = model.load_params(args.restore_checkpoint)
 
     print(f"Training on device: {jax.devices()[0]}")
 
@@ -64,6 +99,12 @@ def main():
         level = stage["level"]
         steps = stage["steps"]
         lr = stage["lr"]
+        entropy = stage["entropy"]
+
+        # Skip stages that precede --start-stage
+        if level < args.start_stage:
+            global_step_counter += steps
+            continue
 
         print(f"\n" + "#" * 60)
         print(f"STARTING CURRICULUM STAGE {level} ({steps} steps, LR: {lr})")
@@ -89,21 +130,21 @@ def main():
         make_inference_fn, params, _ = ppo.train(
             environment=env,
             num_timesteps=steps,
-            num_evals=15,
-            reward_scaling=1.0,           
+            num_evals=30,
+            reward_scaling=0.01,            # Compress reward range to stabilize PPO critic
             episode_length=450,           
             normalize_observations=True,  # Crucial stabilizing feature for JAX environments
             action_repeat=1,
             
             # Aligned Parallelism Configs
-            num_envs=2048,
-            unroll_length=8,
-            num_minibatches=256,
-            num_updates_per_batch=4,
+            num_envs=4096,               # Doubled parallel environments (VRAM up)
+            unroll_length=256,           # Keeps a strong 256-step trajectory horizon
+            num_minibatches=128,         # (4096 * 256) / 512 = 2,048 steps per minibatch
+            num_updates_per_batch=4,     # Standard PPO sweet-spot for deep learning utility
             
             discounting=0.99,
             learning_rate=lr,
-            entropy_cost=1.0e-2,
+            entropy_cost=entropy,         # Annealed per curriculum stage (2e-2 → 5e-3)
             
             seed=0,
             progress_fn=progress,
@@ -126,18 +167,47 @@ def main():
         # Loop until a valid choice is entered to avoid accidental aborts
         while True:
             choice = input(
-                f"\nWould you like to advance to the next curriculum stage? [y]es / [n]o / [q]uit: "
+                f"\nWould you like to advance to the next curriculum stage?\n"
+                f"  [y]  Yes   — continue to stage {level + 1}\n"
+                f"  [r]  Run   — evaluate stage {level} checkpoint (enjoy_jax.py)\n"
+                f"  [s]  Stage — restart stage {level} from scratch (reloads updated code, uses XLA cache)\n"
+                f"  [n]  No    — exit training\n"
+                f"Choice: "
             ).strip().lower()
-            
+
             if choice in ['y', 'yes']:
                 print(f"\nConfirmed! Resuming execution and initializing curriculum level {level + 1}...")
                 break
+            elif choice in ['r', 'run', 'eval']:
+                print(f"\nLaunching evaluation with checkpoint: {stage_final_path}")
+                subprocess.run(
+                    [
+                        "python", "enjoy_jax.py",
+                        "--model-path", stage_final_path,
+                        "--curriculum-level", str(level),
+                        "--steps", "600",
+                    ],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                )
+                print("\nEvaluation finished. Returning to training prompt...")
+            elif choice in ['s', 'stage', 'restart']:
+                print(f"\nRestarting stage {level} from scratch with updated code...")
+                print(f"   XLA cache: {_jax_cache}")
+                print("   (Recompilation skipped if JAX-traced code is unchanged)")
+                subprocess.Popen(
+                    [
+                        sys.executable, os.path.abspath(__file__),
+                        "--start-stage", str(level),
+                    ],
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
+                )
+                print("New training process launched. Exiting current process.")
+                sys.exit(0)
             elif choice in ['n', 'no', 'q', 'quit']:
                 print(f"\nExiting training loop as requested. Your progress up to stage {level} is safely preserved.")
-                import sys
                 sys.exit(0)
             else:
-                print("Invalid response. Please enter 'y' to continue, or 'n' to stop training.")
+                print("Invalid response. Please enter 'y', 'r', 's', or 'n'.")
 
         restore_params = params
         global_step_counter += steps

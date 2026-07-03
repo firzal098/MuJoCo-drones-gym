@@ -1,18 +1,50 @@
+# Version control
 .git
 .gitignore
+
+# Python bytecode
 __pycache__
 **/__pycache__
 *.pyc
 *.pyo
+
+# Package build artifacts
 *.egg-info
+build/
+dist/
+
+# Tests
 .pytest_cache
+unit_tests/
+
+# Runtime / generated
 .jax_cache
 results/
 logs/
+
+# Media / demos (keep image small)
 demo_gifs/
-unit_tests/
 *.mp4
+*.gif
+
+# Misc
 MUJOCO_LOG.TXT
 mujoco_menagerie/
 *.zip
 .DS_Store
+paper.pdf
+paper.pdf:Zone.Identifier
+
+# Training scripts — NOT baked into the deps image.
+# They will be cloned from the repo at container start.
+train_*.py
+enjoy*.py
+render_demos*.py
+evaluate_policy.py
+export_onnx.py
+infer_onnx_demo.py
+verify_env*.py
+inspect_tensorboard.py
+measure_time_travel.py
+test_*.py
+tensorboard_result.txt
