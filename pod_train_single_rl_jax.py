@@ -2,6 +2,7 @@ import os
 import sys
 import argparse
 import subprocess
+
 # Force JAX to allocate memory dynamically as needed instead of pre-claiming 75%
 # Limit compiler parallel threads to reduce peak host-RAM spikes during optimization
 os.environ["XLA_FLAGS"] = "--xla_gpu_force_compilation_parallelism=1"
@@ -25,36 +26,32 @@ from multi_drone_mujoco.jax_envs.krti_arena_jax import KRTIAviaryJax
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="JAX-native curriculum training for KRTI gate navigation."
+        description="JAX-native single-stage curriculum training for KRTI gate navigation."
     )
     parser.add_argument(
-        "--start-stage",
+        "--stage",
         type=int,
         default=1,
         choices=[1, 2, 3, 4, 5],
-        help="Which curriculum stage to start from (default: 1). "
-             "Stages before this are skipped.",
+        help="Which curriculum stage to train (default: 1).",
     )
     parser.add_argument(
         "--restore-checkpoint",
         type=str,
         default=None,
-        help="Path to a saved Brax checkpoint to restore params from before "
-             "starting --start-stage. If omitted, training starts from scratch.",
+        help="Path to a saved Brax checkpoint to restore params from. "
+             "If omitted, it will try to auto-load the final model from the previous stage.",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    stage = args.stage
 
     print("=" * 60)
-    print("Launching Overhauled JAX-Native Curriculum Gate Navigation")
+    print(f"Launching JAX-Native Training for Curriculum Stage {stage}")
     print("=" * 60)
-    if args.start_stage > 1:
-        print(f"[RESUME] Starting from curriculum stage {args.start_stage}")
-    if args.restore_checkpoint:
-        print(f"[RESUME] Restoring params from: {args.restore_checkpoint}")
 
     # Register the environment with Brax
     envs.register_environment('krti_gate_jax', KRTIAviaryJax)
@@ -64,158 +61,104 @@ def main():
     checkpoint_directory = os.path.join(output_directory, "checkpoints")
     os.makedirs(checkpoint_directory, exist_ok=True)
     
-    # Setup TensorBoard log directory
+    # Setup TensorBoard log directory for this specific stage
     tb_dir = os.path.join(output_directory, "tensorboard")
     os.makedirs(tb_dir, exist_ok=True)
     run_idx = 1
-    while os.path.exists(os.path.join(tb_dir, f"run_{run_idx}")):
+    while os.path.exists(os.path.join(tb_dir, f"run_stage_{stage}_{run_idx}")):
         run_idx += 1
-    run_dir = os.path.join(tb_dir, f"run_{run_idx}")
+    run_dir = os.path.join(tb_dir, f"run_stage_{stage}_{run_idx}")
     
     from torch.utils.tensorboard import SummaryWriter
     tb_writer = SummaryWriter(run_dir)
     print(f"Logging TensorBoard events to: {run_dir}")
 
-
-    curriculum_stages = [
-        {"level": 1, "steps": 12_000_000, "lr": 3.0e-3, "entropy": 2.0e-2},  # Fixed config, high exploration
-        {"level": 2, "steps": 12_000_000, "lr": 2.5e-3, "entropy": 1.5e-2},  # Minor variations
-        {"level": 3, "steps": 12_000_000, "lr": 2.0e-4, "entropy": 1.0e-2},  # Moderate variations, speed scaling
-        {"level": 4, "steps": 12_000_000, "lr": 1.5e-4, "entropy": 7.5e-3},  # Camera noise, aggressive offset
-        {"level": 5, "steps": 12_000_000, "lr": 1.0e-4, "entropy": 5.0e-3},  # Full domain randomization
-    ]
-
-    global_step_counter = 0
-    # Restore from a checkpoint if one was provided (e.g. when restarting a stage)
+    # Restore checkpoint loading
     restore_params = None
     if args.restore_checkpoint:
-        print(f"Loading restore checkpoint: {args.restore_checkpoint}")
+        print(f"[RESTORE] Loading custom restore checkpoint: {args.restore_checkpoint}")
         restore_params = model.load_params(args.restore_checkpoint)
+    elif stage > 1:
+        # Auto-restore from previous stage final parameter file
+        prev_stage_path = os.path.join(output_directory, f"stage_{stage-1}_final")
+        if os.path.exists(prev_stage_path):
+            print(f"[AUTO-RESTORE] Found previous stage final model. Loading: {prev_stage_path}")
+            restore_params = model.load_params(prev_stage_path)
+        else:
+            print(f"[WARNING] No checkpoint found for previous stage at {prev_stage_path}. Starting Stage {stage} from scratch!")
 
     print(f"Training on device: {jax.devices()[0]}")
 
+    # Build stage environment
+    env = KRTIAviaryJax(curriculum_level=stage)
 
-    for stage_idx, stage in enumerate(curriculum_stages):
-        level = stage["level"]
-        steps = stage["steps"]
-        lr = stage["lr"]
-        entropy = stage["entropy"]
+    # Compile-cache functions import
+    import functools
+    from brax.training.agents.ppo import networks as ppo_networks
+    
+    custom_network_factory = functools.partial(
+        ppo_networks.make_ppo_networks,
+        policy_hidden_layer_sizes=(256, 256),
+        value_hidden_layer_sizes=(256, 256)
+    )
 
-        # Skip stages that precede --start-stage
-        if level < args.start_stage:
-            global_step_counter += steps
-            continue
+    stage_steps = 20_971_520  # 5 epochs of 4.19M steps
+    stage_evals = 20          # Evaluate 20 times per stage
 
-        print(f"\n" + "#" * 60)
-        print(f"STARTING CURRICULUM STAGE {level} ({steps} steps, LR: {lr})")
-        print("#" * 60)
+    def progress_fn(num_steps, metrics):
+        print(f"[Stage {stage}] Step {num_steps} - Reward: {metrics['eval/episode_reward']:.2f}")
+        for name, value in metrics.items():
+            tb_writer.add_scalar(name, float(value), num_steps)
 
-        # Initialize environment corresponding to this stage
-        env = KRTIAviaryJax(curriculum_level=level)
+    def checkpoint_fn(current_step, make_policy, params):
+        checkpoint_path = os.path.join(checkpoint_directory, f"checkpoint_stage{stage}_{current_step}")
+        model.save_params(checkpoint_path, params)
+        print(f" -> Checkpoint saved: Stage {stage} Step {current_step}")
 
-        # Checkpoint saving callback function
-        def save_checkpoint(current_step, make_policy, params):
-            checkpoint_path = os.path.join(checkpoint_directory, f"checkpoint_stage_{level}_{current_step}")
-            model.save_params(checkpoint_path, params)
-            print(f" -> Checkpoint saved: Stage {level} step {current_step}")
+    print(f"Training Stage {stage} for {stage_steps} steps (evals={stage_evals})...")
+    make_inference_fn, params, _ = ppo.train(
+        environment=env,
+        num_timesteps=stage_steps,
+        num_evals=stage_evals,
+        reward_scaling=1.0,
+        episode_length=450,
+        normalize_observations=True,
+        action_repeat=1,
+        network_factory=custom_network_factory,
+        
+        # PPO Hyperparameters
+        num_envs=2048,
+        unroll_length=128,
+        batch_size=1024,
+        num_minibatches=32,
+        num_updates_per_batch=4,
+        
+        discounting=0.99,
+        learning_rate=3e-4,
+        entropy_cost=0.01,
+        
+        seed=0,
+        progress_fn=progress_fn,
+        policy_params_fn=checkpoint_fn,
+        restore_params=restore_params
+    )
 
-        # Progress tracking callback function (Point 10)
-        def progress(num_steps, metrics):
-            global_steps = global_step_counter + num_steps
-            print(f"Stage {level} - Step {num_steps} (Global: {global_steps}) - Reward: {metrics['eval/episode_reward']:.2f}")
-            for name, value in metrics.items():
-                tb_writer.add_scalar(name, float(value), global_steps)
+    # Save stage final parameters
+    stage_final_path = os.path.join(output_directory, f"stage_{stage}_final")
+    model.save_params(stage_final_path, params)
+    print(f"[SUCCESS] Completed Stage {stage}. Parameters saved to {stage_final_path}")
 
+    # Also duplicate final params to the subsequent stages for enjoy_jax compatibility
+    for lvl in range(stage, 6):
+        compat_path = os.path.join(output_directory, f"stage_{lvl}_final")
+        model.save_params(compat_path, params)
 
-        make_inference_fn, params, _ = ppo.train(
-            environment=env,
-            num_timesteps=steps,
-            num_evals=30,
-            reward_scaling=0.1,            # Compress reward range to stabilize PPO critic
-            episode_length=450,           
-            normalize_observations=True,  # Crucial stabilizing feature for JAX environments
-            action_repeat=1,
-            
-            # Aligned Parallelism Configs
-            num_envs=32768,               # Doubled parallel environments (VRAM up)
-            unroll_length=512,           # Keeps a strong 256-step trajectory horizon
-            num_minibatches=64,         # (4096 * 256) / 512 = 2,048 steps per minibatch
-            num_updates_per_batch=8,     # Standard PPO sweet-spot for deep learning utility
-            
-            discounting=0.99,
-            learning_rate=lr,
-            entropy_cost=entropy,         # Annealed per curriculum stage (2e-2 → 5e-3)
-            
-            seed=0,
-            progress_fn=progress,
-            policy_params_fn=save_checkpoint,
-            restore_params=restore_params
-        )
+    tb_writer.close()
+    print("\n" + "=" * 60)
+    print(f"CURRICULUM STAGE {stage} COMPLETED SUCCESSFULLY.")
+    print("Parameters saved to results directory.")
+    print("=" * 60)
 
-        # Save stage final parameters and hot-start next level
-        stage_final_path = os.path.join(output_directory, f"stage_{level}_final")
-        model.save_params(stage_final_path, params)
-        print(f"Saved optimized curriculum level {level} parameters.")
-
-        print("\n" + "=" * 60)
-        print(f"STAGE {level} TRAINING COMPLETED SUCCESSFULLY.")
-        print(f"Parameters saved to: {stage_final_path}")
-        print("The training process is now paused.")
-        print("You can run your evaluation script using the saved weights above.")
-        print("=" * 60)
-
-        # Loop until a valid choice is entered to avoid accidental aborts
-        while True:
-            choice = input(
-                f"\nWould you like to advance to the next curriculum stage?\n"
-                f"  [y]  Yes   — continue to stage {level + 1}\n"
-                f"  [r]  Run   — evaluate stage {level} checkpoint (enjoy_jax.py)\n"
-                f"  [s]  Stage — restart stage {level} from scratch (reloads updated code, uses XLA cache)\n"
-                f"  [n]  No    — exit training\n"
-                f"Choice: "
-            ).strip().lower()
-
-            if choice in ['y', 'yes']:
-                print(f"\nConfirmed! Resuming execution and initializing curriculum level {level + 1}...")
-                break
-            elif choice in ['r', 'run', 'eval']:
-                print(f"\nLaunching evaluation with checkpoint: {stage_final_path}")
-                subprocess.run(
-                    [
-                        "python", "enjoy_jax.py",
-                        "--model-path", stage_final_path,
-                        "--curriculum-level", str(level),
-                        "--steps", "600",
-                    ],
-                    cwd=os.path.dirname(os.path.abspath(__file__)),
-                )
-                print("\nEvaluation finished. Returning to training prompt...")
-            elif choice in ['s', 'stage', 'restart']:
-                print(f"\nRestarting stage {level} from scratch with updated code...")
-                print(f"   XLA cache: {_jax_cache}")
-                print("   (Recompilation skipped if JAX-traced code is unchanged)")
-                subprocess.Popen(
-                    [
-                        sys.executable, os.path.abspath(__file__),
-                        "--start-stage", str(level),
-                    ],
-                    cwd=os.path.dirname(os.path.abspath(__file__)),
-                )
-                print("New training process launched. Exiting current process.")
-                sys.exit(0)
-            elif choice in ['n', 'no', 'q', 'quit']:
-                print(f"\nExiting training loop as requested. Your progress up to stage {level} is safely preserved.")
-                sys.exit(0)
-            else:
-                print("Invalid response. Please enter 'y', 'r', 's', or 'n'.")
-
-        restore_params = params
-        global_step_counter += steps
-
-
-    output_path = os.path.join(output_directory, "final_curriculum_policy")
-    model.save_params(output_path, restore_params)
-    print(f"\nCurriculum complete. Finalised parameters saved to {output_path}")
 
 if __name__ == "__main__":
     main()

@@ -47,7 +47,7 @@ def trend_summary(history):
 
 
 def inspect_latest_run_fast():
-    tb_dir = "/home/firza/MuJoCo-drones-gym/results/krti_single_rl_jax/tensorboard"
+    tb_dir = "./results/krti_single_rl_jax/tensorboard"
     runs = sorted(
         glob.glob(os.path.join(tb_dir, "run_*")), key=lambda x: int(x.split("_")[-1])
     )
@@ -84,9 +84,13 @@ def inspect_latest_run_fast():
                 val = tf.make_ndarray(value.tensor)
                 data[tag].append((event.step, float(val)))
 
+    # Define keywords that appear in your metrics and rewards
+    metric_keywords = ["reward", "eval", "crash", "gate", "cleared"]
+
+    # Dynamically grab any tag that matches our criteria
     tags_of_interest = [
         tag for tag in data.keys()
-        if "eval/" in tag or tag in ["crashed", "cleared_gate", "gate_collided"]
+        if any(kw in tag.lower() for kw in metric_keywords)
     ]
 
     for tag in tags_of_interest:

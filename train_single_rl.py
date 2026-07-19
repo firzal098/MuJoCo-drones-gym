@@ -1,15 +1,16 @@
 import os
 import sys
+import argparse
+from collections import deque
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import mujoco
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.monitor import Monitor  # <-- Add this import at the top
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
+from stable_baselines3.common.monitor import Monitor
 
-# Import custom aviary/arena components
 from multi_drone_mujoco.envs.base_aviary import BaseAviary
 from multi_drone_mujoco.utils.enums import DroneModel, Physics, ActionType
 from multi_drone_mujoco.examples.krti_arena import KRTIAviary, get_gate_corners, project_point
@@ -18,7 +19,7 @@ from multi_drone_mujoco.control.guided_mode import GuidedVehicle
 DEBUG_GUI = False
 RECORD_GIF = False  # Set to True to record episodes and save them as a GIF
 SHOW_FPV_GUI = False  # Set to True to spawn a custom FPV target tracker window instead of the standard MuJoCo GUI
-NUM_ENVS = 1 if (DEBUG_GUI or SHOW_FPV_GUI) else 6
+NUM_ENVS = 1 if (DEBUG_GUI or SHOW_FPV_GUI) else 5
 
 class SingleGateTrainingWrapper(gym.Wrapper):
     """
@@ -172,7 +173,8 @@ class SingleGateTrainingWrapper(gym.Wrapper):
         # Randomize spawn offset around start zone by up to +/- 60cm in X and Y
         dx = np.random.uniform(-0.6, 0.6)
         dy = np.random.uniform(-0.6, 0.6)
-        self.env.INIT_XYZS[0] = np.array([0.92 + dx, 24.47 + dy, 0.25])
+        # Spawn directly at hover altitude 1.0m for instant training start
+        self.env.INIT_XYZS[0] = np.array([0.92 + dx, 24.47 + dy, 1.0])
 
         # 3. Domain Randomization - Drone Spawn Heading
         # Base yaw is -pi/2 (pointing South towards the gate). Randomize by up to +/- 0.2 rad (~11.5 deg)
@@ -187,36 +189,22 @@ class SingleGateTrainingWrapper(gym.Wrapper):
             self.gif_frames = []
             self.gif_frames.append(self.capture_frame())
 
-        # Reset and arm GuidedVehicle
+        # Reset, arm, and immediately set GuidedVehicle to GUIDED hover mode
         self.vehicle.disarm()
         self.vehicle.arm()
+        self.vehicle.mode = "GUIDED"
         
-        # Take off and stabilize at 1.0m altitude
-        self.vehicle.simple_takeoff(1.0)
-        
-        # Run takeoff loop dynamically
-        for _ in range(150):
-            if self.vehicle.mode == "GUIDED":
-                break
-            rpm = self.vehicle.update(self.env.CTRL_TIMESTEP)
-            self.env.step(rpm)
-            if self.env.render_mode == "human":
-                self.env.render()
-            if self.show_fpv_gui:
-                self.render_fpv_hud()
-            if self.record_gif:
-                self.gif_frames.append(self.capture_frame())
-            
-        # Settle in hover for 20 steps
-        for _ in range(20):
-            rpm = self.vehicle.update(self.env.CTRL_TIMESTEP)
-            self.env.step(rpm)
-            if self.env.render_mode == "human":
-                self.env.render()
-            if self.show_fpv_gui:
-                self.render_fpv_hud()
-            if self.record_gif:
-                self.gif_frames.append(self.capture_frame())
+        # Settle physics only if rendering GUI or recording GIF
+        if self.env.render_mode == "human" or self.show_fpv_gui or self.record_gif:
+            for _ in range(5):
+                rpm = self.vehicle.update(self.env.CTRL_TIMESTEP)
+                self.env.step(rpm)
+                if self.env.render_mode == "human":
+                    self.env.render()
+                if self.show_fpv_gui:
+                    self.render_fpv_hud()
+                if self.record_gif:
+                    self.gif_frames.append(self.capture_frame())
 
         self.active_gate_idx = 0
         self.current_step = 0
@@ -227,7 +215,18 @@ class SingleGateTrainingWrapper(gym.Wrapper):
         map_noise[2] = 0.0
         self.noisy_gate_position = self.gate_targets[0]["pos"] + map_noise
 
+        self._reset_metric_trackers()
+
         return self._get_obs(), info
+
+    def _reset_metric_trackers(self):
+        self.ep_reward_progress = 0.0
+        self.ep_reward_centering = 0.0
+        self.ep_reward_yaw_heading = 0.0
+        self.ep_reward_height = 0.0
+        self.ep_reward_smooth = 0.0
+        self.ep_reward_out_of_range = 0.0
+        self.ep_reward_terminal = 0.0
 
     def capture_frame(self):
         """Captures a 3D tracking frame of the drone for GIF recording."""
@@ -375,7 +374,7 @@ class SingleGateTrainingWrapper(gym.Wrapper):
         dist_after = np.linalg.norm(target_gate - self.env.pos[0])
 
         # 1. Trajectory Progression Reward Matrix
-        reward = (dist_before - dist_after) * 20.0
+        r_progress = (dist_before - dist_after) * 15.0
 
         # Continuous Heading Alignment Penalty (Yaw Error)
         drone_pos = self.env.pos[0]
@@ -387,11 +386,16 @@ class SingleGateTrainingWrapper(gym.Wrapper):
         rel_gate_body_y = -rel_gate_world[0] * sin_y + rel_gate_world[1] * cos_y
         
         yaw_error = np.arctan2(rel_gate_body_y, rel_gate_body_x)
-        reward -= 0.15 * abs(yaw_error)
+        r_yaw_heading = -0.20 * abs(yaw_error)
 
-        # Continuous Vertical Alignment Penalty (Height Error)
+        # Continuous Vertical Alignment Penalty (Increased from -0.15 to -1.0 to prevent ground-diving)
         height_error = rel_gate_world[2]
-        reward -= 0.15 * abs(height_error)
+        r_height = -1.0 * abs(height_error)
+
+        # Low altitude warning penalty (penalize getting dangerously close to ground before gate)
+        agl = self.env.pos[0, 2]
+        if agl < 0.50:
+            r_height -= 1.0 * (0.50 - agl)
 
         # Alignment error penalty (penalize displacement of the gate from camera center)
         yolo_box = self._compute_fake_yolo()
@@ -401,27 +405,41 @@ class SingleGateTrainingWrapper(gym.Wrapper):
             err_x = x_center - 0.5
             err_y = y_center - 0.5
             alignment_penalty = 1.0 * np.sqrt(err_x**2 + err_y**2)
-            reward -= alignment_penalty
+            r_centering = -alignment_penalty
+            r_out_of_range = 0.0
         else:
             # Penalize losing visual contact with target gate
-            reward -= 0.20
+            r_centering = 0.0
+            r_out_of_range = -0.30
+
+        # Action Efficiency / Stabilization Constraints
+        r_smooth = -0.05 * np.sum(np.square(action))
+
+        # Time/Step Penalty
+        r_time = -0.05
+
+        step_reward = r_progress + r_yaw_heading + r_height + r_centering + r_out_of_range + r_smooth + r_time
 
         terminated = False
         truncated = False
+        cleared_gate = False
+        gate_collided = False
+        r_terminal = 0.0
 
         # 2. Threshold Detection Check (Successful Gate Passage)
-        # Use 0.40 to ensure we catch the pass, but reward it heavily for being near 0.0!
         if dist_after < 0.40:
             center_accuracy_bonus = (0.40 - dist_after) * 500.0  # Up to +200 bonus for perfect center
-            reward += 200.0 + center_accuracy_bonus
+            r_terminal = 300.0 + center_accuracy_bonus
             if self.show_fpv_gui or self.record_gif or self.rank == 0:
                 print(f" --> [MISSION COMPLETE] Cleared Gate! (Accuracy Bonus: +{center_accuracy_bonus:.1f})")
             terminated = True
+            cleared_gate = True
 
         # Check collision with gate
         if self._check_gate_collision():
-            reward -= 450.0  # Heavy penalty for gate collision
+            r_terminal = -250.0  # Rebalanced collision penalty
             terminated = True
+            gate_collided = True
             if self.show_fpv_gui or self.record_gif or self.rank == 0:
                 print(" --> [CRASH] Collided with Gate Single A!")
 
@@ -434,20 +452,42 @@ class SingleGateTrainingWrapper(gym.Wrapper):
             abs(rpy[1]) > np.pi/2.5
         )
 
-        if has_crashed:
-            reward -= 200.0  # Heavy crash penalty
+        if has_crashed and not terminated:
+            r_terminal = -250.0  # Rebalanced crash penalty
             terminated = True
             if self.show_fpv_gui or self.record_gif or self.rank == 0:
                 print(" --> [CRASH] Drone hit the ground or flipped!")
 
-        # 4. Action Efficiency / Stabilization Constraints
-        reward -= 0.05 * np.sum(np.square(action))
-
-        # 5. Time/Step Penalty to encourage forward progress and avoid cowardly hovering
-        reward -= 0.10
+        crashed = has_crashed or gate_collided
 
         if self.current_step >= self.max_episode_steps:
             truncated = True
+
+        reward = step_reward + r_terminal
+
+        # Accumulate metrics for TensorBoard
+        self.ep_reward_progress += r_progress
+        self.ep_reward_centering += r_centering
+        self.ep_reward_yaw_heading += r_yaw_heading
+        self.ep_reward_height += r_height
+        self.ep_reward_smooth += r_smooth
+        self.ep_reward_out_of_range += r_out_of_range
+        self.ep_reward_terminal += r_terminal
+
+        if terminated or truncated:
+            info["metrics"] = {
+                "crashed": float(crashed),
+                "cleared_gate": float(cleared_gate),
+                "gate_collided": float(gate_collided),
+                "gate_distance": float(dist_after),
+                "reward_progress": float(self.ep_reward_progress),
+                "reward_centering": float(self.ep_reward_centering),
+                "reward_yaw_heading": float(self.ep_reward_yaw_heading),
+                "reward_height": float(self.ep_reward_height),
+                "reward_smooth": float(self.ep_reward_smooth),
+                "reward_terminal": float(self.ep_reward_terminal),
+                "reward_out_of_range": float(self.ep_reward_out_of_range),
+            }
 
         # Capture frame at the end of step
         if self.record_gif:
@@ -458,6 +498,47 @@ class SingleGateTrainingWrapper(gym.Wrapper):
             self.save_gif("./results/trajectory.gif")
 
         return self._get_obs(), reward, terminated, truncated, info
+
+class TensorboardCallback(BaseCallback):
+    """
+    Custom callback for logging environment metrics (crashed, cleared_gate, gate_collided, 
+    gate_distance, and reward components) to TensorBoard as rolling averages over completed episodes.
+    """
+    def __init__(self, window_size=100, verbose=0):
+        super().__init__(verbose)
+        self.window_size = window_size
+        self.metrics_history = {
+            "crashed": deque(maxlen=window_size),
+            "cleared_gate": deque(maxlen=window_size),
+            "gate_collided": deque(maxlen=window_size),
+            "gate_distance": deque(maxlen=window_size),
+            "reward_progress": deque(maxlen=window_size),
+            "reward_centering": deque(maxlen=window_size),
+            "reward_yaw_heading": deque(maxlen=window_size),
+            "reward_height": deque(maxlen=window_size),
+            "reward_smooth": deque(maxlen=window_size),
+            "reward_terminal": deque(maxlen=window_size),
+            "reward_out_of_range": deque(maxlen=window_size),
+        }
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get("dones", [])
+        infos = self.locals.get("infos", [])
+        for idx, done in enumerate(dones):
+            if done and idx < len(infos):
+                info = infos[idx]
+                if "metrics" in info:
+                    for key, val in info["metrics"].items():
+                        if key in self.metrics_history:
+                            self.metrics_history[key].append(float(val))
+
+        # Log rolling averages across recent completed episodes
+        for key, hist in self.metrics_history.items():
+            if len(hist) > 0:
+                prefix = "metrics" if key in ["crashed", "cleared_gate", "gate_collided", "gate_distance"] else "reward"
+                self.logger.record(f"{prefix}/{key}", float(np.mean(hist)))
+        return True
+
 
 def make_headless_env(rank=0):
     def _init():
@@ -507,45 +588,141 @@ def make_env(gui=False, rank=0):
     return _init
 
 
-if __name__ == "__main__":
-    output_directory = "./results/krti_single_rl/"
-    os.makedirs(output_directory, exist_ok=True)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Single-gate RL training using Stable-Baselines3 PPO."
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Relative or absolute path to a pre-trained PPO model checkpoint (.zip) to restore/continue training from. "
+             "If omitted, training starts fresh from scratch by default."
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./results/krti_single_rl/",
+        help="Output directory to save checkpoints and TensorBoard logs (default: ./results/krti_single_rl/)."
+    )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=10,
+        help="Number of parallel environment processes (default: 5)."
+    )
+    parser.add_argument(
+        "--timesteps",
+        type=int,
+        default=1_000_000,
+        help="Total timesteps to train (default: 2,000,000)."
+    )
+    parser.add_argument(
+        "--learning-rate", "--lr",
+        type=float,
+        default=3e-4,
+        help="PPO learning rate (default: 3e-4)."
+    )
+    parser.add_argument(
+        "--n-steps",
+        type=int,
+        default=2048,
+        help="Number of steps to run for each environment per update (default: 2048)."
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Minibatch size for PPO updates (default: 64)."
+    )
+    parser.add_argument(
+        "--n-epochs",
+        type=int,
+        default=10,
+        help="Number of epoch optimization passes per PPO update (default: 10)."
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.99,
+        help="Discount factor gamma (default: 0.99)."
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="PyTorch compute device: 'auto', 'cpu', or 'cuda' (default: 'auto')."
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Enable 3D GUI visualization mode."
+    )
+    return parser.parse_args()
 
-    # Launch 4 synchronous lightweight math environments in parallel
-    if DEBUG_GUI:
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    output_directory = args.output
+    os.makedirs(output_directory, exist_ok=True)
+    tb_directory = os.path.join(output_directory, "tensorboard")
+    os.makedirs(tb_directory, exist_ok=True)
+
+    use_gui = args.gui or DEBUG_GUI
+    num_envs = 1 if (use_gui or SHOW_FPV_GUI) else args.num_envs
+
+    if use_gui:
         from stable_baselines3.common.vec_env import DummyVecEnv
 
         env_cluster = DummyVecEnv([make_env(gui=True, rank=0)])
     else:
         env_cluster = SubprocVecEnv(
-            [make_env(gui=False, rank=i) for i in range(NUM_ENVS)]
+            [make_env(gui=False, rank=i) for i in range(num_envs)]
         )
 
     print("=" * 60)
-    print("Launching Headless Single-Gate RL Training System")
-    print(f"  Parallel instances active: {NUM_ENVS}")
+    print("Launching Single-Gate RL Training System")
+    print(f"  Output directory         : {output_directory}")
+    print(f"  Restore model checkpoint : {args.model if args.model else 'None (Start from scratch)'}")
+    print(f"  Parallel instances active : {num_envs}")
+    print(f"  Total timesteps          : {args.timesteps:,}")
+    print(f"  Learning rate            : {args.learning_rate}")
+    print(f"  Batch size / n_steps     : {args.batch_size} / {args.n_steps}")
+    print(f"  Device                   : {args.device}")
     print("=" * 60)
 
-    model_path = os.path.join(output_directory, "final_krti_single_brain")
-    if os.path.exists(model_path + ".zip"):
-        print(f"\n[TRANSFER LEARNING] Loading pre-trained model from {model_path}.zip to continue training...\n")
-        model = PPO.load(model_path, env=env_cluster, tensorboard_log=os.path.join(output_directory, "tensorboard"))
+    if args.model:
+        model_path = args.model
+        if model_path.endswith(".zip"):
+            model_path = model_path[:-4]
+        if os.path.exists(model_path + ".zip"):
+            print(f"\n[TRANSFER LEARNING] Loading model checkpoint from {model_path}.zip...\n")
+            model = PPO.load(
+                model_path,
+                env=env_cluster,
+                tensorboard_log=tb_directory,
+                device=args.device
+            )
+        else:
+            print(f"\n[ERROR] Specified model checkpoint not found: {model_path}.zip")
+            sys.exit(1)
     else:
-        print("\n[START FRESH] No pre-trained model found. Initializing a new PPO model from scratch...\n")
+        print("\n[START FRESH] No --model path specified. Initializing a new PPO model from scratch...\n")
         model = PPO(
             "MlpPolicy",
             env_cluster,
-            learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
+            learning_rate=args.learning_rate,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
             verbose=1,
-            tensorboard_log=os.path.join(output_directory, "tensorboard"),
-            device="cpu"
+            tensorboard_log=tb_directory,
+            device=args.device
         )
 
-    if DEBUG_GUI:
+    if use_gui:
         env = env_cluster.envs[0]      # DummyVecEnv only
         env.reset()
         if not SHOW_FPV_GUI:
@@ -555,12 +732,12 @@ if __name__ == "__main__":
         time.sleep(5)
 
     checkpoint_tracker = CheckpointCallback(
-        save_freq=15_000,
+        save_freq=50_000,
         save_path=output_directory,
         name_prefix="krti_single_brain"
     )                           
+    tb_callback = TensorboardCallback()
 
-    # Execute 800,000 steps of headless interaction optimization
-    model.learn(total_timesteps=2_000_000, callback=checkpoint_tracker)
+    model.learn(total_timesteps=args.timesteps, callback=[checkpoint_tracker, tb_callback])
     model.save(os.path.join(output_directory, "final_krti_single_brain"))
     print("Optimization tracking sequence complete.")
